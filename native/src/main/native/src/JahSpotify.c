@@ -39,6 +39,7 @@
 sp_session *g_sess = NULL;
 /// Handle to the curren track
 sp_track *g_currenttrack = NULL;
+static void track_ended(jboolean forced);
 
 jobject g_connectionListener = NULL;
 jobject g_playbackListener = NULL;
@@ -47,6 +48,7 @@ jobject g_mediaLoadedListener = NULL;
 extern jclass g_linkClass;
 extern jclass g_playlistCLass;
 
+pthread_mutex_t g_spotify_mutex;
 /// Synchronization mutex for the main thread
 static pthread_mutex_t g_notify_mutex;
 /// Synchronization condition variable for the main thread
@@ -55,11 +57,12 @@ static pthread_cond_t g_notify_cond;
 static int g_notify_do;
 /// Non-zero when a track has ended and a new one has not yet started a new one
 static int g_playback_done;
+static int g_playback_stopped;
 static int g_stop_after_logout = 0;
 static int g_stop = 0;
 
 static media *loading = NULL;
-static pthread_mutex_t g_loading_mutex;
+
 
 void populateJAlbumInstanceFromAlbumBrowse(JNIEnv *env, sp_album *album, sp_albumbrowse *albumBrowse, jobject albumInstance);
 void populateJArtistInstanceFromArtistBrowse(JNIEnv *env, sp_artistbrowse *artistBrowse, jobject artist);
@@ -132,28 +135,26 @@ static void SP_CALLCONV playlist_renamed(sp_playlist *pl, void *userdata) {
 
 static void SP_CALLCONV playlist_state_changed(sp_playlist *pl, void *userdata) {
 	sp_link *link = sp_link_create_from_playlist(pl);
-	char *linkName = malloc(sizeof(char) * 100);
-
+	char *linkName = calloc(1, sizeof(char) * 1024);
 	log_debug("jahspotify", "playlist_state_changed", "State changed on playlist: %s", sp_playlist_name(pl));
-
 	if (link) {
-		sp_link_as_string(link, linkName, 100);
-		log_debug("jahspotify", "playlist_state_changed", "Playlist state changed: %s link: %s (loaded: %s)", sp_playlist_name(pl), linkName,
-				(sp_playlist_is_loaded(pl) ? "yes" : "no"));
-
-		jobject playlist = (jobject) userdata;
-		if (sp_playlist_is_loaded(pl)) {
-			sp_playlist_remove_callbacks(pl, &pl_callbacks, userdata);
-
-			JNIEnv* env = NULL;
-			if (!retrieveEnv((JNIEnv*) &env)) return;
-
-			createJPlaylist(env, playlist, pl);
-			(*env)->DeleteGlobalRef(env, playlist);
-			detachThread();
-		}
-
-		sp_link_release(link);
+          sp_link_as_string(link, linkName, 1024);
+          log_debug("jahspotify", "playlist_state_changed", "Playlist state changed: %s link: %s (loaded: %s)", sp_playlist_name(pl), linkName,
+                    (sp_playlist_is_loaded(pl) ? "yes" : "no"));
+          
+          jobject playlist = (jobject) userdata;
+          if (sp_playlist_is_loaded(pl)) {
+            sp_playlist_remove_callbacks(pl, &pl_callbacks, userdata);
+            
+            JNIEnv* env = NULL;
+            if (!retrieveEnv((JNIEnv*) &env)) return;
+            
+            createJPlaylist(env, playlist, pl);
+            (*env)->DeleteGlobalRef(env, playlist);
+            detachThread();
+          }
+          
+          sp_link_release(link);
 	}
 	if (linkName) free(linkName);
 }
@@ -222,29 +223,32 @@ static void SP_CALLCONV playlist_added(sp_playlistcontainer *pc, sp_playlist *pl
  * @param  userdata      The opaque pointer
  */
 static void SP_CALLCONV playlist_removed(sp_playlistcontainer *pc, sp_playlist *pl, int position, void *userdata) {
-    sp_playlist_remove_callbacks( pl, &pl_callbacks, NULL );
-
-	const char *name = sp_playlist_name(pl);
-	log_debug("jahspotify", "playlist_removed", "Playlist removed: %s", name);
-
-	JNIEnv* env = NULL;
-	if (!retrieveEnv((JNIEnv*) &env)) return;
-
-	sp_link *link = sp_link_create_from_playlist(pl);
-	char *linkName = malloc(sizeof(char) * 100);
-	sp_link_as_string(link, linkName, 100);
-	jstring jString = (*env)->NewStringUTF(env, linkName);
-
-	jclass jPc = (*env)->FindClass(env, "jahspotify/media/PlaylistContainer");
-	if (jPc == NULL ) {
-		log_error("jahspotify", "playlist_removed", "Unable to get playlistcontainer class.");
-		return;
-	}
-	jmethodID jMethod = (*env)->GetStaticMethodID(env, jPc, "removePlaylist", "(Ljava/lang/String;)V");
-	(*env)->CallStaticVoidMethod(env, jPc, jMethod, jString);
-
-	if (linkName) free(linkName);
-	if (jString) (*env)->DeleteLocalRef(env, jString);
+  JNIEnv* env = NULL;
+  if (!retrieveEnv((JNIEnv*) &env)) return;
+  pthread_mutex_lock(&g_spotify_mutex);
+  sp_playlist_remove_callbacks( pl, &pl_callbacks, NULL );
+  
+  const char *name = sp_playlist_name(pl);
+  log_debug("jahspotify", "playlist_removed", "Playlist removed: %s", name);
+  
+  
+  sp_link *link = sp_link_create_from_playlist(pl);
+  char *linkName = malloc(sizeof(char) * 100);
+  sp_link_as_string(link, linkName, 100);
+  jstring jString = (*env)->NewStringUTF(env, linkName);
+  
+  jclass jPc = (*env)->FindClass(env, "jahspotify/media/PlaylistContainer");
+  if (jPc == NULL ) {
+    log_error("jahspotify", "playlist_removed", "Unable to get playlistcontainer class.");
+    pthread_mutex_unlock(&g_spotify_mutex);
+    return;
+  }
+  jmethodID jMethod = (*env)->GetStaticMethodID(env, jPc, "removePlaylist", "(Ljava/lang/String;)V");
+  (*env)->CallStaticVoidMethod(env, jPc, jMethod, jString);
+  
+  if (linkName) free(linkName);
+  if (jString) (*env)->DeleteLocalRef(env, jString);
+  pthread_mutex_unlock(&g_spotify_mutex);
 }
 
 /**
@@ -254,14 +258,16 @@ static void SP_CALLCONV playlist_removed(sp_playlistcontainer *pc, sp_playlist *
  * @param  userdata      The opaque pointer
  */
 static void SP_CALLCONV container_loaded(sp_playlistcontainer *pc, void *userdata) {
-	int i;
-	// Make sure all playlists are added.
-	for (i = 0; i < sp_playlistcontainer_num_playlists(pc); ++i) {
-		sp_playlist *pl = sp_playlistcontainer_playlist(pc, i);
-		playlist_added(pc, pl, i, userdata);
-	}
-	signalPlaylistsLoaded();
-}
+  pthread_mutex_lock(&g_spotify_mutex);
+  int i;
+  // Make sure all playlists are added.
+  for (i = 0; i < sp_playlistcontainer_num_playlists(pc); ++i) {
+    sp_playlist *pl = sp_playlistcontainer_playlist(pc, i);
+    playlist_added(pc, pl, i, userdata);
+  }
+  signalPlaylistsLoaded();
+  pthread_mutex_unlock(&g_spotify_mutex);
+ }
 
 /**
  * The playlist container callbacks
@@ -276,34 +282,35 @@ static sp_playlistcontainer_callbacks pc_callbacks = { .playlist_added = &playli
  * @sa sp_session_callbacks#logged_in
  */
 static void SP_CALLCONV logged_in(sp_session *sess, sp_error error) {
-	if (SP_ERROR_OK != error) {
-		log_error("jahspotify", "logged_in", "Login failed: %s", sp_error_message(error));
-		signalLoggedIn(0);
-		return;
-	}
-
-	sp_playlistcontainer *pc = sp_session_playlistcontainer(sess);
-	sp_playlistcontainer_add_callbacks(sp_session_playlistcontainer(g_sess), &pc_callbacks, NULL );
-
-	log_debug("jahspotify", "logged_in", "Login Success: %d", sp_playlistcontainer_num_playlists(pc));
-	signalLoggedIn(1);
-	log_debug("jahspotify", "logged_in", "All done");
+  if (SP_ERROR_OK != error) {
+    log_error("jahspotify", "logged_in", "Login failed: %s", sp_error_message(error));
+    signalLoggedIn(0);
+    return;
+  }
+  pthread_mutex_lock(&g_spotify_mutex);
+  sp_playlistcontainer *pc = sp_session_playlistcontainer(sess);
+  sp_playlistcontainer_add_callbacks(sp_session_playlistcontainer(g_sess), &pc_callbacks, NULL );
+  
+  log_debug("jahspotify", "logged_in", "Login Success: %d", sp_playlistcontainer_num_playlists(pc));
+  signalLoggedIn(1);
+  log_debug("jahspotify", "logged_in", "All done");
+  pthread_mutex_unlock(&g_spotify_mutex);
 }
 
 static void SP_CALLCONV credentials_blob_updated(sp_session *session, const char *blob) {
-	signalBlobUpdated(blob);
+  signalBlobUpdated(blob);
 }
 
 static void SP_CALLCONV logged_out(sp_session *sess) {
-	log_debug("jahspotify", "logged_out", "Logged out");
-	signalLoggedOut();
-	if (g_stop_after_logout) {
-		pthread_mutex_lock(&g_notify_mutex);
-		g_stop = 1;
-		g_notify_do = 1;
-		pthread_cond_signal(&g_notify_cond);
-		pthread_mutex_unlock(&g_notify_mutex);
-	}
+  log_debug("jahspotify", "logged_out", "Logged out");
+  signalLoggedOut();
+  if (g_stop_after_logout) {
+    pthread_mutex_lock(&g_notify_mutex);
+    g_stop = 1;
+    g_notify_do = 1;
+    pthread_cond_signal(&g_notify_cond);
+    pthread_mutex_unlock(&g_notify_mutex);
+  }
 }
 
 /**
@@ -315,10 +322,10 @@ static void SP_CALLCONV logged_out(sp_session *sess) {
  * @sa sp_session_callbacks#notify_main_thread
  */
 static void SP_CALLCONV notify_main_thread(sp_session *sess) {
-	pthread_mutex_lock(&g_notify_mutex);
-	g_notify_do = 1;
-	pthread_cond_signal(&g_notify_cond);
-	pthread_mutex_unlock(&g_notify_mutex);
+  pthread_mutex_lock(&g_notify_mutex);
+  g_notify_do = 1;
+  pthread_cond_signal(&g_notify_cond);
+  pthread_mutex_unlock(&g_notify_mutex);
 }
 
 /**
@@ -327,24 +334,24 @@ static void SP_CALLCONV notify_main_thread(sp_session *sess) {
  * @sa sp_session_callbacks#music_delivery
  */
 static int SP_CALLCONV music_delivery(sp_session *sess, const sp_audioformat *format, const void *frames, int num_frames) {
-	if (num_frames == 0) return 0; // Audio discontinuity, do nothing
-
-	JNIEnv* env = NULL;
-	if (!retrieveEnv((JNIEnv*) &env)) return 0;
-
-	invokeVoidMethod_II(env, g_playbackListener, "setAudioFormat", (jint) format->sample_rate, (jint) format->channels);
-
-	int sampleSize = 2 * format->channels;
-	int numBytes = num_frames * sampleSize;
-
-	jbyteArray byteArray = (*env)->NewByteArray(env, numBytes);
-
-	(*env)->SetByteArrayRegion(env, byteArray, 0, numBytes, (jbyte*) frames);
-	int buffered;
-	invokeIntMethod_B(env, g_playbackListener, "addToBuffer", &buffered, byteArray);
-
-	(*env)->DeleteLocalRef(env, byteArray);
-	return buffered;
+  if (num_frames == 0) return 0; // Audio discontinuity, do nothing
+  
+  JNIEnv* env = NULL;
+  if (!retrieveEnv((JNIEnv*) &env)) return 0;
+  
+  invokeVoidMethod_II(env, g_playbackListener, "setAudioFormat", (jint) format->sample_rate, (jint) format->channels);
+  
+  int sampleSize = 2 * format->channels;
+  int numBytes = num_frames * sampleSize;
+  
+  jbyteArray byteArray = (*env)->NewByteArray(env, numBytes);
+  
+  (*env)->SetByteArrayRegion(env, byteArray, 0, numBytes, (jbyte*) frames);
+  int buffered;
+  invokeIntMethod_B(env, g_playbackListener, "addToBuffer", &buffered, byteArray);
+  
+  (*env)->DeleteLocalRef(env, byteArray);
+  return buffered;
 }
 
 /**
@@ -353,10 +360,10 @@ static int SP_CALLCONV music_delivery(sp_session *sess, const sp_audioformat *fo
  * @sa sp_session_callbacks#end_of_track
  */
 static void SP_CALLCONV end_of_track(sp_session *sess) {
-	pthread_mutex_lock(&g_notify_mutex);
-	g_playback_done = 1;
-	pthread_cond_signal(&g_notify_cond);
-	pthread_mutex_unlock(&g_notify_mutex);
+  pthread_mutex_lock(&g_notify_mutex);
+  g_playback_done = 1;
+  pthread_cond_signal(&g_notify_cond);
+  pthread_mutex_unlock(&g_notify_mutex);
 }
 
 /**
@@ -579,8 +586,8 @@ JNIEXPORT jobject JNICALL Java_jahspotify_impl_JahSpotifyImpl_retrieveUser(JNIEn
 }
 
 char* createLinkStr(sp_link *link) {
-	char *linkStr = calloc(1, sizeof(char) * (100));
-	sp_link_as_string(link, linkStr, 100);
+	char *linkStr = calloc(1, sizeof(char) * (1024));
+	sp_link_as_string(link, linkStr, 1024);
 	return linkStr;
 }
 
@@ -589,8 +596,7 @@ jobject createJLinkInstance(JNIEnv *env, sp_link *link) {
 	jobject linkInstance = NULL;
 	jmethodID jMethod = NULL;
 
-	char *linkStr = malloc(sizeof(char) * (100));
-	sp_link_as_string(link, linkStr, 100);
+	char *linkStr = createLinkStr(link);
 
 	jstring jString = (*env)->NewStringUTF(env, linkStr);
 
@@ -1382,146 +1388,148 @@ JNIEXPORT void JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeTrackSeek(JNIEn
 	sp_session_player_seek(g_sess, offset);
 }
 
+
 JNIEXPORT void JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeStopTrack(JNIEnv *env, jobject obj) {
-	log_debug("jahspotify", "nativeStopTrack", "Stopping playback");
-	sp_session_player_unload(g_sess);
-  sp_track_release(g_currenttrack);
-  g_currenttrack = NULL;
+  log_debug("jahspotify", "nativeStopTrack", "Stopping playback");
+  pthread_mutex_lock(&g_notify_mutex);
+  g_playback_stopped = 1;
+  pthread_cond_signal(&g_notify_cond);
+  pthread_mutex_unlock(&g_notify_mutex);
 }
 
 JNIEXPORT void JNICALL Java_jahspotify_impl_JahSpotifyImpl_setBitrate(JNIEnv * env, jobject obj, jint rate) {
-	sp_session_preferred_bitrate(g_sess, rate);
+  sp_session_preferred_bitrate(g_sess, rate);
+}
+
+static jint doPlay(const char *nativeURI) {
+  
+  log_debug("jahspotify", "nativePlayTrack", "Initiating play: %s", nativeURI);
+  
+  // For each track, read out the info and populate all of the info in the Track instance
+  pthread_mutex_lock(&g_spotify_mutex);
+  sp_link *link = sp_link_create_from_string(nativeURI);
+  if (link) {
+    sp_track *t = sp_link_as_track(link);
+    
+    if (!t) {
+      log_error("jahspotify", "nativePlayTrack", "No track from link");
+      pthread_mutex_unlock(&g_spotify_mutex);
+      return -1;
+    }
+    
+    int count = 0;
+    while (!sp_track_is_loaded(t) && count < 4) {
+      usleep(250);
+      count++;
+    }
+    
+    if (count == 4) {
+      log_warn("jahspotify", "nativePlayTrack", "Track not loaded after 1 second, will have to wait for callback");
+      pthread_mutex_unlock(&g_spotify_mutex);
+      return -1;
+    }
+    
+    if (sp_track_error(t) != SP_ERROR_OK) {
+      log_debug("jahspotify", "nativePlayTrack", "Error with track: %s", sp_error_message(sp_track_error(t)));
+      pthread_mutex_unlock(&g_spotify_mutex);
+      return -1;
+    }
+    
+    log_debug("jahspotify", "nativePlayTrack", "track name: %s duration: %d", sp_track_name(t), sp_track_duration(t));
+    
+    if (g_currenttrack == t) {
+      log_warn("jahspotify", "nativePlayTrack", "Same track, will not play");
+      pthread_mutex_unlock(&g_spotify_mutex);
+      return -1;
+    }
+    
+    // If there is one playing, unload that now
+    if (g_currenttrack && t != g_currenttrack) {
+      // Unload the current track now
+      //session_player_play(g_sess, 0);
+      track_ended(JNI_TRUE);
+    }
+    
+    sp_track_add_ref(t);
+    
+    sp_error result = sp_session_player_load(g_sess, t);
+    int ret;
+    
+    if (sp_track_error(t) != SP_ERROR_OK) {
+      log_error("jahspotify", "nativePlayTrack", "Issue loading track: %s", sp_error_message((sp_track_error(t))));
+      ret = -1;
+    } else {
+      log_debug("jahspotify", "nativePlayTrack", "Track loaded: %s", (result == SP_ERROR_OK ? "yes" : "no"));
+    
+      // Update the global reference
+      g_currenttrack = t;
+      
+      // Start playing the next track
+      sp_session_player_play(g_sess, 1);
+      
+      log_debug("jahspotify", "nativePlayTrack", "Playing track");
+      
+      sp_link_release(link);
+      ret = 1;
+    }
+    pthread_mutex_unlock(&g_spotify_mutex);
+
+    if (ret > 0) {
+      signalTrackStarted(nativeURI);
+    }
+    return ret;
+  } else {
+    log_error("jahspotify", "nativePlayTrack", "Unable to load link at this point");
+  }
+  
+  log_error("jahspotify", "nativePlayTrack", "Error starting play");
+  
+  return 0;
 }
 
 JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativePlayTrack(JNIEnv *env, jobject obj, jstring uri) {
-	const char *nativeURI = NULL;
-
-	nativeURI = (*env)->GetStringUTFChars(env, uri, NULL );
-
-	log_debug("jahspotify", "nativePlayTrack", "Initiating play: %s", nativeURI);
-
-	// For each track, read out the info and populate all of the info in the Track instance
-	sp_link *link = sp_link_create_from_string(nativeURI);
-	if (link) {
-		sp_track *t = sp_link_as_track(link);
-
-		if (!t) {
-			log_error("jahspotify", "nativePlayTrack", "No track from link");
-			return -1;
-		}
-
-		int count = 0;
-		while (!sp_track_is_loaded(t) && count < 4) {
-			usleep(250);
-			count++;
-		}
-
-		if (count == 4) {
-			log_warn("jahspotify", "nativePlayTrack", "Track not loaded after 1 second, will have to wait for callback");
-			return -1;
-		}
-
-		if (sp_track_error(t) != SP_ERROR_OK) {
-			log_debug("jahspotify", "nativePlayTrack", "Error with track: %s", sp_error_message(sp_track_error(t)));
-			return -1;
-		}
-
-		log_debug("jahspotify", "nativePlayTrack", "track name: %s duration: %d", sp_track_name(t), sp_track_duration(t));
-
-		if (g_currenttrack == t) {
-			log_warn("jahspotify", "nativePlayTrack", "Same track, will not play");
-			return -1;
-		}
-
-		// If there is one playing, unload that now
-		if (g_currenttrack && t != g_currenttrack) {
-			// Unload the current track now
-			sp_session_player_unload(g_sess);
-
-			sp_link *currentTrackLink = sp_link_create_from_track(g_currenttrack, 0);
-			char *currentTrackLinkStr = NULL;
-			if (currentTrackLink) {
-				currentTrackLinkStr = calloc(1, sizeof(char) * (100));
-				sp_link_as_string(currentTrackLink, currentTrackLinkStr, 100);
-				sp_link_release(currentTrackLink);
-			}
-
-			if (currentTrackLinkStr) {
-				free(currentTrackLinkStr);
-			}
-
-			sp_track_release(g_currenttrack);
-
-			g_currenttrack = NULL;
-
-		}
-
-		sp_track_add_ref(t);
-
-		sp_error result = sp_session_player_load(g_sess, t);
-
-		if (sp_track_error(t) != SP_ERROR_OK) {
-			log_error("jahspotify", "nativePlayTrack", "Issue loading track: %s", sp_error_message((sp_track_error(t))));
-			goto fail;
-		}
-
-		log_debug("jahspotify", "nativePlayTrack", "Track loaded: %s", (result == SP_ERROR_OK ? "yes" : "no"));
-
-		// Update the global reference
-		g_currenttrack = t;
-
-		// Start playing the next track
-		sp_session_player_play(g_sess, 1);
-
-		log_debug("jahspotify", "nativePlayTrack", "Playing track");
-
-		sp_link_release(link);
-
-		signalTrackStarted(nativeURI);
-
-		goto exit;
-	} else {
-		log_error("jahspotify", "nativePlayTrack", "Unable to load link at this point");
-		goto fail;
-	}
-
-	goto exit;
-
-	fail: log_error("jahspotify", "nativePlayTrack", "Error starting play");
-
-	exit: if (nativeURI) (*env)->ReleaseStringUTFChars(env, uri, (char *) nativeURI);
-	return 0;
+  const char *nativeURI = NULL;
+  pthread_mutex_lock(&g_spotify_mutex);  
+  nativeURI = (*env)->GetStringUTFChars(env, uri, NULL );
+  jint result = doPlay(nativeURI);
+  pthread_mutex_unlock(&g_spotify_mutex);  
+  if (nativeURI) (*env)->ReleaseStringUTFChars(env, uri, (char *) nativeURI);
+  return result;
 }
+
+
 
 /**
  * A track has ended. Remove it from the playlist.
  *
  * Called from the main loop when the music_delivery() callback has set g_playback_done.
  */
-static void track_ended(void) {
-	log_debug("jahspotify", "track_ended", "Called");
-
-	if (g_currenttrack) {
-		sp_link *link = sp_link_create_from_track(g_currenttrack, 0);
-		char *trackLinkStr = NULL;
-		if (link) {
-			trackLinkStr = calloc(1, sizeof(char) * (100));
-			sp_link_as_string(link, trackLinkStr, 100);
-			sp_link_release(link);
-		}
-
-		sp_session_player_unload(g_sess);
-
-		sp_track_release(g_currenttrack);
-
-		g_currenttrack = NULL;
-
-		signalTrackEnded(trackLinkStr, JNI_FALSE);
-
-		if (trackLinkStr) {
-			free(trackLinkStr);
-		}
-	}
+static void track_ended(jboolean forced) {
+  log_debug("jahspotify", "track_ended", "Called");
+  if (g_currenttrack) {
+    log_debug("jahspotify", "track_ended", "current track exists");
+    sp_link *link = sp_link_create_from_track(g_currenttrack, 0);
+    char *trackLinkStr = NULL;
+    if (link) {
+      trackLinkStr = createLinkStr(link);
+      sp_link_release(link);
+    }
+    if (forced) {
+      log_debug("jahspotify", "track_ended", "unload session");
+      sp_session_player_unload(g_sess);
+    }
+    log_debug("jahspotify", "track_ended", "track release");
+    sp_track_release(g_currenttrack);
+    g_currenttrack = NULL;
+    log_debug("jahspotify", "track_ended", "signalling track ended");
+    signalTrackEnded(trackLinkStr, forced);
+    
+    if (trackLinkStr) {
+      free(trackLinkStr);
+    }
+  } else {
+    log_debug("jahspotify", "track_ended", "no current track");
+  }
 }
 
 JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeInitialize(JNIEnv *env, jobject obj, jstring cacheFolder) {
@@ -1529,7 +1537,10 @@ JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeInitialize(JNIE
 	sp_error err;
 	int next_timeout = 0;
 
-	pthread_mutex_init(&g_loading_mutex, NULL );
+        pthread_mutexattr_t Attr;
+        pthread_mutexattr_init(&Attr);
+        pthread_mutexattr_settype(&Attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&g_spotify_mutex, &Attr);
 	pthread_mutex_init(&g_notify_mutex, NULL );
 	pthread_cond_init(&g_notify_cond, NULL );
 
@@ -1555,57 +1566,68 @@ JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeInitialize(JNIE
 
 	g_stop = 0;
 	for (;;) {
-		if (next_timeout == 0) {
-			signalInitialized(1);
-			while (!g_notify_do && !g_playback_done)
-				pthread_cond_wait(&g_notify_cond, &g_notify_mutex);
-		} else {
-			struct timespec ts;
-
+          if (next_timeout == 0) {
+            signalInitialized(1);
+            while (!g_notify_do && !g_playback_done)
+              pthread_cond_wait(&g_notify_cond, &g_notify_mutex);
+          } else {
+            struct timespec ts;
+            
 #if _POSIX_TIMERS > 0
-			clock_gettime ( CLOCK_REALTIME, &ts );
+            clock_gettime ( CLOCK_REALTIME, &ts );
 #else
-			struct timeval tv;
-			gettimeofday(&tv, NULL );
-			//TIMEVAL_TO_TIMESPEC ( &tv, &ts );
-			(&ts)->tv_sec = (&tv)->tv_sec;
-			(&ts)->tv_nsec = (&tv)->tv_usec * 1000;
-			///TIMEVAL_TO_TIMESPEC ( &tv, &ts );
+            struct timeval tv;
+            gettimeofday(&tv, NULL );
+            //TIMEVAL_TO_TIMESPEC ( &tv, &ts );
+            (&ts)->tv_sec = (&tv)->tv_sec;
+            (&ts)->tv_nsec = (&tv)->tv_usec * 1000;
+            ///TIMEVAL_TO_TIMESPEC ( &tv, &ts );
 #endif
-			ts.tv_sec += next_timeout / 1000;
-			ts.tv_nsec += (next_timeout % 1000) * 1000000;
-
-			if (!g_notify_do) // Only wait if we know we have nothing to do.
-				pthread_cond_timedwait(&g_notify_cond, &g_notify_mutex, &ts);
-		}
-
-		g_notify_do = 0;
-		pthread_mutex_unlock(&g_notify_mutex);
-
-		if (g_playback_done) {
-			track_ended();
-			g_playback_done = 0;
-		}
-
-		sp_connectionstate conn_state = sp_session_connectionstate(sp);
-		switch (conn_state) {
-			case SP_CONNECTION_STATE_UNDEFINED:
-			case SP_CONNECTION_STATE_LOGGED_OUT:
-			case SP_CONNECTION_STATE_LOGGED_IN:
-			case SP_CONNECTION_STATE_OFFLINE:
-				break;
-			case SP_CONNECTION_STATE_DISCONNECTED:
-				log_warn("jahspotify", "Java_jahspotify_impl_JahSpotifyImpl_initialize", "Disconnected!");
-				signalDisconnected();
-				break;
-		}
-
-		do {
-			sp_session_process_events(sp, &next_timeout);
-		} while (next_timeout == 0);
-
-		if (g_stop) break;
-		pthread_mutex_lock(&g_notify_mutex);
+            ts.tv_sec += next_timeout / 1000;
+            ts.tv_nsec += (next_timeout % 1000) * 1000000;
+            
+            if (!g_notify_do) // Only wait if we know we have nothing to do.
+              pthread_cond_timedwait(&g_notify_cond, &g_notify_mutex, &ts);
+          }
+          
+          g_notify_do = 0;
+          pthread_mutex_unlock(&g_notify_mutex);
+          pthread_mutex_lock(&g_spotify_mutex);
+          
+          if (g_playback_done) {
+            track_ended(JNI_FALSE);
+            g_playback_done = 0;
+            g_playback_stopped = 0;
+          } else if (g_playback_stopped) {
+            track_ended(JNI_TRUE);
+            g_playback_stopped = 0;
+            g_playback_done = 0;
+          }
+          
+          sp_connectionstate conn_state = sp_session_connectionstate(sp);
+          if (!conn_state) {
+            log_warn("jahspotify", "Java_jahspotify_impl_JahSpotifyImpl_initialize", "conn_state is null");
+          } else {
+            switch (conn_state) {
+            case SP_CONNECTION_STATE_UNDEFINED:
+            case SP_CONNECTION_STATE_LOGGED_OUT:
+            case SP_CONNECTION_STATE_LOGGED_IN:
+            case SP_CONNECTION_STATE_OFFLINE:
+              break;
+            case SP_CONNECTION_STATE_DISCONNECTED:
+              log_warn("jahspotify", "Java_jahspotify_impl_JahSpotifyImpl_initialize", "Disconnected!");
+              signalDisconnected();
+              break;
+            }
+          }
+          
+          do {
+            sp_session_process_events(sp, &next_timeout);
+          } while (next_timeout == 0);
+          
+          pthread_mutex_unlock(&g_spotify_mutex);
+          if (g_stop) break;
+          pthread_mutex_lock(&g_notify_mutex);
 	}
 
 	log_debug("jahspotify", "Java_jahspotify_impl_JahSpotifyImpl_initialize", "Cleaning up.");
@@ -1650,81 +1672,87 @@ JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeLogin(JNIEnv *e
 }
 
 JNIEXPORT void JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeLogout(JNIEnv *env, jobject obj) {
-	sp_session_logout(g_sess);
+  pthread_mutex_lock(&g_notify_mutex);
+  sp_session_logout(g_sess);
+  pthread_mutex_unlock(&g_notify_mutex);
 }
 
 JNIEXPORT void JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeForgetMe(JNIEnv *env, jobject obj) {
-	sp_session_forget_me(g_sess);
+  pthread_mutex_lock(&g_notify_mutex);
+  sp_session_forget_me(g_sess);
+  pthread_mutex_unlock(&g_notify_mutex);
 }
 
 JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeDestroy(JNIEnv *env, jobject obj) {
-	g_stop_after_logout = 1;
-	sp_session_logout(g_sess);
-	return 0;
+  pthread_mutex_lock(&g_notify_mutex);
+  g_stop_after_logout = 1;
+  sp_session_logout(g_sess);
+  pthread_mutex_unlock(&g_notify_mutex);
+  return 0;
 }
 
 
 void addLoading(jobject javainstance, sp_track* track, sp_album* album, sp_artist* artist, int browse) {
-	pthread_mutex_lock(&g_loading_mutex);
-
-	media *lmedia = malloc(sizeof *lmedia);
-	lmedia->prev = NULL;
-	lmedia->next = loading;
-	lmedia->javainstance = javainstance;
-	lmedia->track = track;
-	lmedia->album = album;
-	lmedia->artist = artist;
-	lmedia->browse = browse;
-
-	if (loading != NULL)
+  pthread_mutex_lock(&g_spotify_mutex);
+  
+  media *lmedia = malloc(sizeof *lmedia);
+  lmedia->prev = NULL;
+  lmedia->next = loading;
+  lmedia->javainstance = javainstance;
+  lmedia->track = track;
+  lmedia->album = album;
+  lmedia->artist = artist;
+  lmedia->browse = browse;
+  
+  if (loading != NULL)
 		loading->prev = lmedia;
-	loading = lmedia;
-
-	pthread_mutex_unlock(&g_loading_mutex);
+  loading = lmedia;
+  
+  pthread_mutex_unlock(&g_spotify_mutex);
 }
 
 void checkLoaded() {
-	pthread_mutex_lock(&g_loading_mutex);
-
-	JNIEnv* env = NULL;
-
-	media *checkload = loading;
-	while (checkload != NULL) {
-
-		if (  (checkload->track && sp_track_is_loaded(checkload->track))
-		   || (checkload->artist && sp_artist_is_loaded(checkload->artist))
-		   || (checkload->album && sp_album_is_loaded(checkload->album))) {
-			if (loading == checkload) { // First
-				loading = checkload->next;
-				if (loading != NULL)
-					loading->prev = NULL;
-			} else { // Any other.
-				if (checkload->prev != NULL)
-					checkload->prev->next = checkload->next;
-				if (checkload->next != NULL)
-					checkload->next->prev = checkload->prev;
-			}
-
-			if (!env && !retrieveEnv((JNIEnv*) &env)) return;
-
-			if (checkload->track) {
-				populateJTrackInstance(env, checkload->javainstance, checkload->track);
-			} else if (checkload->artist) {
-				populateJArtistInstance(env, checkload->javainstance, checkload->artist, checkload->browse);
-			} else if (checkload->album) {
-				populateJAlbumInstance(env, checkload->javainstance, checkload->album, checkload->browse);
-			}
-			(*env)->DeleteGlobalRef(env, checkload->javainstance);
-
-			media *toFree = checkload;
-			checkload = checkload->next;
-			free(toFree);
-		} else {
-			checkload = checkload->next;
-		}
-	}
-	if (env)
-		detachThread();
-
-	pthread_mutex_unlock(&g_loading_mutex);
+  pthread_mutex_lock(&g_spotify_mutex);
+  
+  JNIEnv* env = NULL;
+  
+  media *checkload = loading;
+  while (checkload != NULL) {
+    
+    if (  (checkload->track && sp_track_is_loaded(checkload->track))
+          || (checkload->artist && sp_artist_is_loaded(checkload->artist))
+          || (checkload->album && sp_album_is_loaded(checkload->album))) {
+      if (loading == checkload) { // First
+        loading = checkload->next;
+        if (loading != NULL)
+          loading->prev = NULL;
+      } else { // Any other.
+        if (checkload->prev != NULL)
+          checkload->prev->next = checkload->next;
+        if (checkload->next != NULL)
+          checkload->next->prev = checkload->prev;
+      }
+      
+      if (!env && !retrieveEnv((JNIEnv*) &env)) return;
+      
+      if (checkload->track) {
+        populateJTrackInstance(env, checkload->javainstance, checkload->track);
+      } else if (checkload->artist) {
+        populateJArtistInstance(env, checkload->javainstance, checkload->artist, checkload->browse);
+      } else if (checkload->album) {
+        populateJAlbumInstance(env, checkload->javainstance, checkload->album, checkload->browse);
+      }
+      (*env)->DeleteGlobalRef(env, checkload->javainstance);
+      
+      media *toFree = checkload;
+      checkload = checkload->next;
+      free(toFree);
+    } else {
+      checkload = checkload->next;
+    }
+  }
+  if (env)
+    detachThread();
+  
+  pthread_mutex_unlock(&g_spotify_mutex);
 }

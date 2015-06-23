@@ -1437,16 +1437,11 @@ static jint doPlay(const char *nativeURI) {
     
     log_debug("jahspotify", "nativePlayTrack", "track name: %s duration: %d", sp_track_name(t), sp_track_duration(t));
     
-    if (g_currenttrack == t) {
-      log_warn("jahspotify", "nativePlayTrack", "Same track, will not play");
-      pthread_mutex_unlock(&g_spotify_mutex);
-      return -1;
-    }
     
     // If there is one playing, unload that now
-    if (g_currenttrack && t != g_currenttrack) {
+    if (g_currenttrack) {
       // Unload the current track now
-      //session_player_play(g_sess, 0);
+      sp_session_player_play(g_sess, 0);
       track_ended(JNI_TRUE);
     }
     
@@ -1463,17 +1458,19 @@ static jint doPlay(const char *nativeURI) {
     
       // Update the global reference
       g_currenttrack = t;
-      
-      // Start playing the next track
-      sp_session_player_play(g_sess, 1);
-      
-      log_debug("jahspotify", "nativePlayTrack", "Playing track");
-      
+      if (result != SP_ERROR_OK) {
+        signalTrackStarted(nativeURI);
+        track_ended(JNI_TRUE);
+        ret = 0;
+      } else {
+        // Start playing the next track
+        sp_session_player_play(g_sess, 1);
+        log_debug("jahspotify", "nativePlayTrack", "Playing track");
+      }
       sp_link_release(link);
       ret = 1;
     }
     pthread_mutex_unlock(&g_spotify_mutex);
-
     if (ret > 0) {
       signalTrackStarted(nativeURI);
     }
@@ -1591,19 +1588,17 @@ JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeInitialize(JNIE
           }
           
           g_notify_do = 0;
+          bool playback_done = g_playback_done;
+          bool playback_stopped = g_playback_stopped;
+          g_playback_done = 0;
+          g_playback_stopped = 0;
           pthread_mutex_unlock(&g_notify_mutex);
           pthread_mutex_lock(&g_spotify_mutex);
-          
-          if (g_playback_done) {
+          if (playback_done) {
             track_ended(JNI_FALSE);
-            g_playback_done = 0;
-            g_playback_stopped = 0;
-          } else if (g_playback_stopped) {
+          } else if (playback_stopped) {
             track_ended(JNI_TRUE);
-            g_playback_stopped = 0;
-            g_playback_done = 0;
           }
-          
           sp_connectionstate conn_state = sp_session_connectionstate(sp);
           if (!conn_state) {
             log_warn("jahspotify", "Java_jahspotify_impl_JahSpotifyImpl_initialize", "conn_state is null");

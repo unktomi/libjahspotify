@@ -110,7 +110,7 @@ public interface JahSpotify {
 	 * @return The processed playlist
 	 */
 	public Playlist readPlaylist(Link link, final int index,
-			final int numEntries);
+                                     final int numEntries);
 
 	/**
 	 * Retrieves a toplist.

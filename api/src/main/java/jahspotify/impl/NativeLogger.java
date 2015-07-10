@@ -28,7 +28,7 @@ import org.apache.commons.logging.LogFactory;
 public class NativeLogger
 {
     private static Log _log = LogFactory.getLog(NativeLogger.class);
-    public static final boolean SYSOUT = false;
+    public static final boolean SYSOUT = true;
 
     public static void trace(final String component, final String subComponent, final String message)
     {

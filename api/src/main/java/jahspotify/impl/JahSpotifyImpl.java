@@ -633,7 +633,7 @@ public class JahSpotifyImpl implements JahSpotify
     	}
     }
 
-    private Playlist trimPlaylist(final Playlist playlist, final int index, final int numEntries)
+    private Playlist trimPlaylist(final Playlist playlist, final int index, int numEntries)
     {
         Playlist trimmedPlaylist = new Playlist();
         trimmedPlaylist.setAuthor(playlist.getAuthor());
@@ -642,10 +642,11 @@ public class JahSpotifyImpl implements JahSpotify
         trimmedPlaylist.setId(playlist.getId());
         trimmedPlaylist.setName(playlist.getName());
         trimmedPlaylist.setPicture(playlist.getPicture());
+        numEntries = Math.min(numEntries, playlist.getNumTracks());
         trimmedPlaylist.setNumTracks(numEntries == 0 ? playlist.getNumTracks() : numEntries);
         trimmedPlaylist.setIndex(index);
         // FIXME: Trim this list
-        trimmedPlaylist.setTracks(playlist.getTracks().subList(index, numEntries));
+        trimmedPlaylist.setTracks(playlist.getTracks().subList(index, numEntries-index));
         return null;
     }
 

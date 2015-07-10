@@ -58,7 +58,7 @@
                 <OS>windows</OS>
                 <spotify>${env.LIB_SPOTIFY}</spotify>
 
-                <compilerparams>"-I${java.home}\..\include"
+                <compilerparams>"-I${java.home}\..\include" "-g"
                     "-I${java.home}\..\include\win32" "-I${spotify}\include"
                 </compilerparams>
                 <linkeropts>"${spotify}\lib\libspotify.lib"</linkeropts>

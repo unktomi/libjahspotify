@@ -1437,6 +1437,7 @@ static jint doPlay(const char *nativeURI) {
     
     log_debug("jahspotify", "nativePlayTrack", "track name: %s duration: %d", sp_track_name(t), sp_track_duration(t));
     
+
     
     // If there is one playing, unload that now
     if (g_currenttrack) {
@@ -1458,6 +1459,7 @@ static jint doPlay(const char *nativeURI) {
     
       // Update the global reference
       g_currenttrack = t;
+
       if (result != SP_ERROR_OK) {
         signalTrackStarted(nativeURI);
         track_ended(JNI_TRUE);
@@ -1599,6 +1601,19 @@ JNIEXPORT jint JNICALL Java_jahspotify_impl_JahSpotifyImpl_nativeInitialize(JNIE
           } else if (playback_stopped) {
             track_ended(JNI_TRUE);
           }
+          pthread_mutex_unlock(&g_notify_mutex);
+          pthread_mutex_lock(&g_spotify_mutex);
+          
+          if (g_playback_done) {
+            track_ended(JNI_FALSE);
+            g_playback_done = 0;
+            g_playback_stopped = 0;
+          } else if (g_playback_stopped) {
+            track_ended(JNI_TRUE);
+            g_playback_stopped = 0;
+            g_playback_done = 0;
+          }
+          
           sp_connectionstate conn_state = sp_session_connectionstate(sp);
           if (!conn_state) {
             log_warn("jahspotify", "Java_jahspotify_impl_JahSpotifyImpl_initialize", "conn_state is null");
